@@ -1,6 +1,9 @@
 import os
+import asyncio
+import shutil
 from uuid import uuid4
-from fastapi import FastAPI, BackgroundTasks, HTTPException
+from typing import Dict
+from fastapi import FastAPI, BackgroundTasks, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 import yt_dlp
@@ -8,103 +11,165 @@ import yt_dlp
 app = FastAPI()
 
 # --- CONFIGURACIÓN ---
-
-# 1. CORS: Permite que tu futuro Frontend (React) se comunique con este servidor
-origins = [
-    "http://localhost:3000", # React default
-    "http://localhost:5173", # Vite default
-]
-
+origins = ["http://localhost:3000", "http://localhost:5173"]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Content-Disposition"],
 )
 
-# 2. Directorio de descargas
-# Creamos una carpeta 'downloads' dentro de 'backend' si no existe
 DOWNLOADS_DIR = os.path.join(os.getcwd(), "downloads")
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 
-# --- LÓGICA DEL NEGOCIO ---
+# --- GESTOR WEBSOCKETS ---
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: Dict[str, WebSocket] = {}
 
-def download_logic(url: str):
-    """
-    Función síncrona que maneja yt-dlp.
-    Descarga el video, extrae audio y lo convierte a MP3.
-    """
-    file_id = str(uuid4())
-    
-    # Configuración técnica de yt-dlp
+    async def connect(self, client_id: str, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections[client_id] = websocket
+
+    def disconnect(self, client_id: str):
+        if client_id in self.active_connections:
+            del self.active_connections[client_id]
+
+    async def send_progress(self, client_id: str, data: dict):
+        if client_id in self.active_connections:
+            await self.active_connections[client_id].send_json(data)
+
+manager = ConnectionManager()
+
+# --- LÓGICA DE DESCARGA AVANZADA ---
+def download_logic(url: str, client_id: str):
+    unique_id = str(uuid4())
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    # 1. Hook de progreso (Ahora soporta info de Playlist)
+    def progress_hook(d):
+        if d['status'] == 'downloading':
+            try:
+                # Calculamos % del archivo actual
+                total = d.get('total_bytes') or d.get('total_bytes_estimate')
+                downloaded = d.get('downloaded_bytes', 0)
+                percent = (downloaded / total) * 100 if total else 0
+                
+                # 🔥 Extraemos info de la playlist (si existe)
+                info = d.get('info_dict', {})
+                playlist_index = info.get('playlist_index')
+                n_entries = info.get('n_entries')
+                
+                status_msg = "downloading"
+                extra_info = ""
+                
+                if playlist_index and n_entries:
+                    # Mensaje tipo: "Canción 3 de 15"
+                    extra_info = f" ({playlist_index}/{n_entries})"
+                
+                coro = manager.send_progress(client_id, {
+                    "status": status_msg, 
+                    "percent": f"{percent:.1f}",
+                    "text": f"Descargando{extra_info}: {percent:.1f}%"
+                })
+                asyncio.run_coroutine_threadsafe(coro, main_loop)
+            except Exception:
+                pass
+        
+        elif d['status'] == 'finished':
+            coro = manager.send_progress(client_id, {"status": "converting", "percent": "100", "text": "Procesando audio..."})
+            asyncio.run_coroutine_threadsafe(coro, main_loop)
+
+    # 2. Configuración base de yt-dlp
     ydl_opts = {
         'format': 'bestaudio/best',
-        # Plantilla de nombre: ID_Titulo.extensión (ej: a1b2_Cancion.mp3)
-        'outtmpl': f'{DOWNLOADS_DIR}/{file_id}_%(title)s.%(ext)s',
-        'postprocessors': [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'mp3',
-            'preferredquality': '192',
-        }],
-        'noplaylist': False, # Permitimos playlists (descargará la primera o iterará si ampliamos)
-        'quiet': True,       # Menos logs basura en consola
+        'postprocessors': [{'key': 'FFmpegExtractAudio','preferredcodec': 'mp3','preferredquality': '192'}],
+        'noplaylist': False, # 🔥 Permitimos playlists explícitamente
+        'quiet': True,
+        'progress_hooks': [progress_hook],
     }
 
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            # 1. Extraer información antes de descargar
-            info = ydl.extract_info(url, download=True)
+        # 🔥 Paso Crítico: Analizar antes de descargar
+        with yt_dlp.YoutubeDL({'quiet': True}) as ydl_analyzer:
+            info_dict = ydl_analyzer.extract_info(url, download=False)
             
-            # 2. Obtener el nombre del archivo final
-            # yt-dlp a veces devuelve la extensión original, así que forzamos la búsqueda del mp3
-            filename = ydl.prepare_filename(info)
-            final_filename = filename.rsplit('.', 1)[0] + '.mp3'
+        is_playlist = 'entries' in info_dict
+        title = info_dict.get('title', 'audio')
+
+        if is_playlist:
+            # === MODO PLAYLIST (ZIP) ===
             
-            return final_filename
+            # A. Crear carpeta temporal única para esta descarga
+            playlist_folder = os.path.join(DOWNLOADS_DIR, f"{unique_id}_{title}")
+            os.makedirs(playlist_folder, exist_ok=True)
+            
+            # B. Actualizar salida para guardar DENTRO de la carpeta
+            ydl_opts['outtmpl'] = f'{playlist_folder}/%(title)s.%(ext)s'
+            
+            # C. Descargar todo
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
+                
+            # D. Crear ZIP de la carpeta
+            shutil.make_archive(playlist_folder, 'zip', playlist_folder)
+            zip_path = playlist_folder + ".zip"
+            
+            # E. Borrar la carpeta con los mp3 sueltos (ya tenemos el zip)
+            shutil.rmtree(playlist_folder)
+            
+            return zip_path
+            
+        else:
+            # === MODO SINGLE (MP3) ===
+            ydl_opts['outtmpl'] = f'{DOWNLOADS_DIR}/{unique_id}_%(title)s.%(ext)s'
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                filename = ydl.prepare_filename(info)
+                final_filename = filename.rsplit('.', 1)[0] + '.mp3'
+                return final_filename
+
     except Exception as e:
-        print(f"Error crítico en descarga: {e}")
         raise e
 
 def cleanup_file(path: str):
-    """Tarea de fondo: Elimina el archivo del servidor después de enviarlo al usuario"""
     if os.path.exists(path):
-        try:
-            os.remove(path)
-            print(f"✅ Limpieza: Archivo eliminado -> {path}")
-        except Exception as e:
-            print(f"⚠️ Error borrando archivo: {e}")
+        os.remove(path)
 
 # --- ENDPOINTS ---
+@app.websocket("/ws/{client_id}")
+async def websocket_endpoint(websocket: WebSocket, client_id: str):
+    await manager.connect(client_id, websocket)
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        manager.disconnect(client_id)
 
-@app.get("/")
-def read_root():
-    return {"status": "online", "version": "1.0.0"}
+main_loop = None
+
+@app.on_event("startup")
+async def startup_event():
+    global main_loop
+    main_loop = asyncio.get_running_loop()
 
 @app.post("/download")
-async def download_video(url: str, background_tasks: BackgroundTasks):
+async def download_video(url: str, client_id: str, background_tasks: BackgroundTasks):
     try:
-        print(f"📥 Iniciando descarga de: {url}")
+        # Ejecutar en hilo aparte
+        file_path = await asyncio.to_thread(download_logic, url, client_id)
         
-        # Paso 1: Descargar (Esto tomará unos segundos/minutos)
-        file_path = download_logic(url)
-        
-        # Paso 2: Verificar que el archivo existe
-        if not os.path.exists(file_path):
-            raise HTTPException(status_code=500, detail="Error: El archivo no se generó correctamente.")
-
-        # Paso 3: Preparar el nombre para el navegador
         filename = os.path.basename(file_path)
         
-        # Paso 4: Programar la autodestrucción del archivo (Background Task)
+        # Determinar Content-Type correcto (Zip o Mp3)
+        media_type = 'application/zip' if filename.endswith('.zip') else 'audio/mpeg'
+        
         background_tasks.add_task(cleanup_file, file_path)
         
-        # Paso 5: Enviar el archivo al usuario
-        return FileResponse(
-            path=file_path, 
-            filename=filename, 
-            media_type='audio/mpeg'
-        )
-        
+        return FileResponse(path=file_path, filename=filename, media_type=media_type)
     except Exception as e:
+        await manager.send_progress(client_id, {"status": "error"})
         raise HTTPException(status_code=500, detail=str(e))

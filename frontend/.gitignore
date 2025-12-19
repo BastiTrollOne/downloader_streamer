@@ -22,3 +22,10 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Ignorar descargas
+backend/downloads/
+*.mp3
+*.zip
+*.webm
+*.mp4

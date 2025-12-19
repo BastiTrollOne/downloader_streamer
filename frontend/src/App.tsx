@@ -1,152 +1,185 @@
-import { useState } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import axios from 'axios';
-import { Music, Download, Loader2, AlertCircle, CheckCircle2 } from 'lucide-react';
-import { motion, AnimatePresence } from 'framer-motion';
+import { Music, Download, Loader2, Wifi, WifiOff } from 'lucide-react';
 
 function App() {
   const [url, setUrl] = useState('');
-  const [isLoading, setIsLoading] = useState(false);
-  const [status, setStatus] = useState<'idle' | 'success' | 'error'>('idle');
-  const [message, setMessage] = useState('');
+  const [isDownloading, setIsDownloading] = useState(false);
+  const [progress, setProgress] = useState(0); // 0 a 100
+  const [statusText, setStatusText] = useState('');
+  
+  // ID único para esta sesión de navegador
+  const clientId = useRef(Math.random().toString(36).substring(7)).current;
+  const socketRef = useRef<WebSocket | null>(null);
+
+// 1. Conectar WebSocket al iniciar la app
+  useEffect(() => {
+    // Nota: Cambia la URL si no estás en localhost
+    const ws = new WebSocket(`ws://127.0.0.1:8000/ws/${clientId}`);
+    
+    ws.onopen = () => console.log("🟢 Conectado al servidor de progreso");
+    
+    // --- ESTA ES LA ÚNICA PARTE QUE DEBES TENER ---
+    ws.onmessage = (event) => {
+      const data = JSON.parse(event.data);
+      
+      if (data.status === 'downloading') {
+        const p = parseFloat(data.percent);
+        if (!isNaN(p)) {
+            setProgress(p);
+            // 🔥 AHORA USAMOS EL TEXTO QUE VIENE DEL BACKEND
+            // Si es playlist dirá: "Descargando (1/5): 40%"
+            // Si es single dirá: "Descargando: 40%"
+            setStatusText(data.text || `Descargando: ${p.toFixed(1)}%`);
+        }
+      } else if (data.status === 'converting') {
+        setProgress(100);
+        setStatusText(data.text || "Finalizando...");
+      } else if (data.status === 'error') {
+        setStatusText("Error en el servidor");
+        setIsDownloading(false);
+      }
+    };
+    // -----------------------------------------------
+
+    socketRef.current = ws;
+
+    return () => ws.close();
+  }, [clientId]);
 
   const handleDownload = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!url) return;
 
-    setIsLoading(true);
-    setStatus('idle');
-    setMessage('Procesando audio en el servidor... (Esto puede tardar unos segundos)');
+    setIsDownloading(true);
+    setProgress(0);
+    setStatusText('Iniciando...');
 
-    try {
-      // 1. Petición al Backend (FastAPI)
-      // IMPORTANTE: responseType: 'blob' es crucial para manejar archivos binarios
+try {
+// ... (dentro del try)
+
       const response = await axios.post(
-        'http://127.0.0.1:8000/download', 
+        `http://127.0.0.1:8000/download`, 
         null, 
         {
-          params: { url: url },
+          params: { url: url, client_id: clientId },
           responseType: 'blob' 
         }
       );
 
-      // 2. Truco del DOM para descargar el archivo recibido
-      // Creamos una URL temporal en memoria que apunta al blob (el mp3)
+      // --- BLOQUE DE EXTRACCIÓN ROBUSTO ---
+      const disposition = response.headers['content-disposition'];
+      let fileName = `cancion_${clientId}.mp3`; // Nombre por defecto
+
+      if (disposition) {
+        // Caso 1: Estándar moderno (RFC 5987) -> filename*=utf-8''Nombre%20Raro.mp3
+        // Este es el que te está dando problemas ahora
+        const utf8Match = disposition.match(/filename\*=utf-8''(.+)/i);
+        
+        if (utf8Match && utf8Match[1]) {
+          // decodeURIComponent convierte los %20 en espacios y %C3%B3 en ó
+          fileName = decodeURIComponent(utf8Match[1].replace(/['"]/g, ''));
+        } 
+        // Caso 2: Estándar antiguo -> filename="NombreNormal.mp3"
+        else {
+          const filenameMatch = disposition.match(/filename="?([^"]+)"?/i);
+          if (filenameMatch && filenameMatch[1]) {
+            fileName = filenameMatch[1];
+          }
+        }
+      }
+
+      // IMPORTANTE: Si por alguna razón el nombre sigue sin tener extensión, se la forzamos
+      if (!fileName.endsWith('.zip') && !fileName.endsWith('.mp3')) {
+          fileName += '.mp3';
+      }
+
       const blobUrl = window.URL.createObjectURL(new Blob([response.data]));
       const link = document.createElement('a');
       link.href = blobUrl;
-      
-      // Intentamos extraer el nombre del archivo de los headers (si el backend lo envía)
-      // O usamos un genérico
-      const contentDisposition = response.headers['content-disposition'];
-      let fileName = 'audio_descargado.mp3';
-      if (contentDisposition) {
-        const fileNameMatch = contentDisposition.match(/filename="?(.+)"?/);
-        if (fileNameMatch && fileNameMatch.length === 2) fileName = fileNameMatch[1];
-      }
-      
       link.setAttribute('download', fileName);
       document.body.appendChild(link);
-      link.click(); // Click virtual
-      
-      // 3. Limpieza
+      link.click();
       link.remove();
-      window.URL.revokeObjectURL(blobUrl);
-      
-      setStatus('success');
-      setMessage('¡Descarga completada!');
-      setUrl(''); // Limpiar input
-    } catch (error: any) {
+    
+      setStatusText('¡Listo! ✅');
+      setTimeout(() => {
+        setIsDownloading(false);
+        setProgress(0);
+        setUrl('');
+      }, 3000);
+
+    } catch (error) {
       console.error(error);
-      setStatus('error');
-      // Si el error viene del backend (blob), hay que leerlo diferente
-      setMessage('Error al descargar. Verifica que el link sea válido o público.');
-    } finally {
-      setIsLoading(false);
+      setStatusText('Error al descargar');
+      setIsDownloading(false);
     }
   };
 
   return (
-    <div className="min-h-screen flex items-center justify-center p-4">
-      <div className="w-full max-w-md bg-slate-800 rounded-2xl shadow-xl overflow-hidden border border-slate-700">
+    <div className="min-h-screen bg-slate-950 flex items-center justify-center p-4 text-slate-200 font-sans">
+      <div className="w-full max-w-lg bg-slate-900 rounded-2xl border border-slate-800 shadow-2xl overflow-hidden">
         
         {/* Header */}
-        <div className="bg-slate-900 p-6 text-center border-b border-slate-700">
-          <div className="mx-auto w-16 h-16 bg-blue-600 rounded-full flex items-center justify-center mb-4 shadow-lg shadow-blue-500/30">
-            <Music className="w-8 h-8 text-white" />
-          </div>
-          <h1 className="text-2xl font-bold text-white">PY Stream Downloader</h1>
-          <p className="text-slate-400 text-sm mt-1">Ingeniería de descargas YT a MP3</p>
+        <div className="p-8 pb-6 border-b border-slate-800 bg-gradient-to-r from-slate-900 to-slate-800">
+            <div className="flex justify-between items-start">
+                <div className="w-14 h-14 bg-indigo-600 rounded-xl flex items-center justify-center shadow-lg shadow-indigo-500/20 mb-4">
+                    <Music className="w-7 h-7 text-white" />
+                </div>
+                {/* Indicador de conexión WS */}
+                <div className="flex items-center gap-2 text-xs font-mono text-slate-500 bg-slate-950 px-2 py-1 rounded-md border border-slate-800">
+                   ID: {clientId} <Wifi className="w-3 h-3 text-green-500" />
+                </div>
+            </div>
+            <h1 className="text-3xl font-bold text-white tracking-tight">Downloader Pro</h1>
+            <p className="text-slate-400 mt-1">Alta fidelidad • Tiempo Real</p>
         </div>
 
         {/* Body */}
         <div className="p-8">
-          <form onSubmit={handleDownload} className="space-y-6">
-            <div className="space-y-2">
-              <label className="text-sm font-medium text-slate-300 ml-1">URL del Video / Canción</label>
-              <input
-                type="text"
-                placeholder="https://youtube.com/watch?v=..."
-                value={url}
-                onChange={(e) => setUrl(e.target.value)}
-                disabled={isLoading}
-                className="w-full px-4 py-3 bg-slate-900 border border-slate-600 rounded-xl text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all disabled:opacity-50"
-              />
+          <form onSubmit={handleDownload} className="flex flex-col gap-6">
+            <div className="relative">
+                <input
+                    type="text"
+                    value={url}
+                    onChange={(e) => setUrl(e.target.value)}
+                    disabled={isDownloading}
+                    placeholder="Pega el link de YouTube aquí..."
+                    className="w-full bg-slate-950 border border-slate-700 rounded-xl px-4 py-4 focus:ring-2 focus:ring-indigo-500 focus:border-transparent outline-none transition-all placeholder:text-slate-600"
+                />
             </div>
+
+            {/* Barra de Progreso - Solo visible si descarga */}
+            {isDownloading && (
+                <div className="bg-slate-950 rounded-xl p-4 border border-slate-800/50">
+                    <div className="flex justify-between text-xs font-medium text-slate-400 mb-2">
+                        <span>{statusText}</span>
+                        <span>{Math.round(progress)}%</span>
+                    </div>
+                    {/* El contenedor gris */}
+                    <div className="w-full bg-slate-800 rounded-full h-2.5 overflow-hidden">
+                        {/* La barra de color animada */}
+                        <div 
+                            className="bg-indigo-500 h-2.5 rounded-full transition-all duration-300 ease-out shadow-[0_0_10px_rgba(99,102,241,0.5)]" 
+                            style={{ width: `${progress}%` }}
+                        ></div>
+                    </div>
+                </div>
+            )}
 
             <button
               type="submit"
-              disabled={isLoading || !url}
-              className={`w-full py-3.5 px-4 rounded-xl font-semibold flex items-center justify-center gap-2 transition-all transform active:scale-95 ${
-                isLoading || !url
-                  ? 'bg-slate-700 text-slate-400 cursor-not-allowed'
-                  : 'bg-blue-600 hover:bg-blue-500 text-white shadow-lg shadow-blue-600/20'
+              disabled={isDownloading || !url}
+              className={`w-full py-4 rounded-xl font-bold text-lg flex items-center justify-center gap-2 transition-all transform active:scale-[0.98] ${
+                isDownloading 
+                    ? 'bg-slate-800 text-slate-500 cursor-not-allowed' 
+                    : 'bg-indigo-600 hover:bg-indigo-500 text-white shadow-xl shadow-indigo-600/20'
               }`}
             >
-              {isLoading ? (
-                <>
-                  <Loader2 className="w-5 h-5 animate-spin" />
-                  <span>Procesando & Convirtiendo...</span>
-                </>
-              ) : (
-                <>
-                  <Download className="w-5 h-5" />
-                  <span>Descargar MP3</span>
-                </>
-              )}
+              {isDownloading ? <Loader2 className="animate-spin" /> : <Download />}
+              {isDownloading ? 'Procesando...' : 'Descargar Audio'}
             </button>
           </form>
-
-          {/* Status Messages */}
-          <AnimatePresence mode='wait'>
-            {status === 'success' && (
-              <motion.div
-                initial={{ opacity: 0, y: 10 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0 }}
-                className="mt-6 p-4 bg-green-500/10 border border-green-500/20 rounded-xl flex items-center gap-3 text-green-400"
-              >
-                <CheckCircle2 className="w-5 h-5 shrink-0" />
-                <p className="text-sm font-medium">{message}</p>
-              </motion.div>
-            )}
-
-            {status === 'error' && (
-              <motion.div
-                initial={{ opacity: 0, y: 10 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0 }}
-                className="mt-6 p-4 bg-red-500/10 border border-red-500/20 rounded-xl flex items-center gap-3 text-red-400"
-              >
-                <AlertCircle className="w-5 h-5 shrink-0" />
-                <p className="text-sm font-medium">{message}</p>
-              </motion.div>
-            )}
-          </AnimatePresence>
-          
-          {/* Info Footer */}
-          <div className="mt-8 text-center text-xs text-slate-500">
-            <p>Powered by FastAPI & React</p>
-          </div>
         </div>
       </div>
     </div>
